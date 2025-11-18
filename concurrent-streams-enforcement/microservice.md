@@ -112,7 +112,7 @@ async function startSession(userId: string, sessionId: string): Promise<SessionR
     Math.floor(Date.now() / 1000)
   ) as SessionResult;
 
-  // If session evicted, send async notification
+  // If session evicted, send notification (waits for SNS acknowledgment)
   if (result.evicted) {
     await publishEvictionEvent(userId, result.evicted);
   }
@@ -247,7 +247,7 @@ Client → Gateway → Service → Redis → SNS (async)
 - Forward `Idempotency-Key` header from client (if present)
 - Add `X-Request-ID` to all downstream requests
 
-**2. Service receives request** (~1-2ms)
+**2. Service processes request** (~1-2ms)
 ```typescript
 async function startSession(req: Request): Promise<Response> {
   const userId = req.headers['x-user-id']; // From Gateway
@@ -268,18 +268,15 @@ async function startSession(req: Request): Promise<Response> {
   const cacheKey = `idempotency:${userId}:${idempotencyKey}`;
   const cached = await redis.get(cacheKey);
   if (cached) {
-    logger.info('idempotency_cache_hit', { requestId, userId, idempotencyKey });
-    return {
-      ...JSON.parse(cached),
-      headers: { 'X-Request-ID': requestId }
-    };
+    logger.info('idempotency_cache_hit', { requestId, userId });
+    return { ...JSON.parse(cached), headers: { 'X-Request-ID': requestId }};
   }
   
   // Generate new sessionId (server controls ID)
   const sessionId = `sess_${crypto.randomUUID()}`;
-  
   logger.info('processing_session_start', { requestId, userId, sessionId });
   
+  // Execute session enforcement logic
   const result = await startSession(userId, sessionId);
   
   const response = {
@@ -288,45 +285,79 @@ async function startSession(req: Request): Promise<Response> {
     currentCount: result.count
   };
   
-  // Cache result for 5 minutes (idempotency window)
+  // Cache result for idempotency (5 minute window)
   await redis.setex(cacheKey, 300, JSON.stringify(response));
   
-  logger.info('session_start_success', {
-    requestId,
-    userId,
-    sessionId,
-    currentCount: result.count,
-    evicted: result.evicted
-  });
+  // Send eviction notification if needed (WAITS for SNS acknowledgment)
+  if (result.evicted) {
+    await publishEvictionEvent(userId, result.evicted);
+  }
   
-  return {
-    ...response,
-    headers: { 'X-Request-ID': requestId }
-  };
+  logger.info('session_start_success', { requestId, userId, sessionId });
+  
+  return { ...response, headers: { 'X-Request-ID': requestId }};
 }
 ```
 
-**3. Atomic Redis operation** (~3-5ms)
-- Execute Lua script (check + add/evict)
-- Return result with evicted session if any
+**3. Redis: Atomic enforcement** (~3-5ms)
+- Execute Lua script
+- Check count, evict oldest if limit exceeded
+- Add new session
+- Return result
 
-**4. Async notification** (~20ms, non-blocking)
+**4. Redis: Cache idempotency** (~1ms)
+- Store response for 5-minute retry window
+
+**5. SNS: Publish eviction event** (~20ms, only if eviction occurred)
+- Send notification to SNS topic
+- Wait for AWS acknowledgment
+- Only executed when session is evicted
+
 ```typescript
 async function publishEvictionEvent(userId: string, evictedSessionId: string): Promise<void> {
-  await sns.publish({
-    TopicArn: SNS_TOPIC_ARN,
-    Message: JSON.stringify({
-      eventType: 'SESSION_EVICTED',
-      userId,
-      evictedSessionId,
-      timestamp: Date.now()
-    })
-  });
-  // Fire-and-forget, don't wait for delivery
+  try {
+    await sns.publish({
+      TopicArn: SNS_TOPIC_ARN,
+      Message: JSON.stringify({
+        eventType: 'SESSION_EVICTED',
+        userId,
+        evictedSessionId,
+        timestamp: Date.now()
+      })
+    });
+    logger.info('eviction_notification_sent', { userId, evictedSessionId });
+  } catch (error) {
+    logger.error('sns_publish_failed', { userId, evictedSessionId, error });
+    throw error; // Let caller handle retry logic
+  }
 }
 ```
 
-**Total latency: ~10-20ms** (P99 target: <100ms)
+**6. Generate response** (~1ms)
+- Serialize JSON
+- Add headers
+
+### Service Processing Time Breakdown
+
+```
+Step                                Time        Cumulative
+─────────────────────────────────────────────────────────────
+1. Gateway (JWT validation)         5-10ms      5-10ms
+2. Service (parse, logging)         1-2ms       6-12ms
+3. Redis Lua script                 3-5ms       9-17ms
+4. Redis cache (idempotency)        1ms         10-18ms
+5. SNS publish (if eviction)*       20ms        30-38ms
+6. Response generation              1ms         11-19ms / 31-39ms
+─────────────────────────────────────────────────────────────
+```
+
+**Total Service Latency:**
+- **No eviction** (95% of requests): ~**11-19ms** ✅
+- **With eviction** (5% of requests): ~**31-39ms** (adds SNS wait time)
+  
+**P99 Target**: <100ms
+
+**Note**: SNS publish adds ~20ms **only when a session is evicted**. Most requests complete in 11-19ms.
 
 **Response Headers**:
 ```http
